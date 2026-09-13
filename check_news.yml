@@ -1,0 +1,39 @@
+name: Проверка новостей о переговорах по Украине
+
+on:
+  schedule:
+    # Запуск каждые 20 минут (время указано в UTC)
+    - cron: "*/20 * * * *"
+  workflow_dispatch: {}  # позволяет запускать вручную кнопкой на GitHub
+
+permissions:
+  contents: write
+
+jobs:
+  check-news:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Скачать код репозитория
+        uses: actions/checkout@v4
+
+      - name: Установить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Установить зависимости
+        run: pip install -r requirements.txt
+
+      - name: Запустить проверку новостей
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+        run: python news_bot.py
+
+      - name: Сохранить список отправленных ссылок
+        run: |
+          git config user.name "news-bot"
+          git config user.email "news-bot@users.noreply.github.com"
+          git add seen_links.json
+          git diff --staged --quiet || git commit -m "Обновление списка отправленных новостей"
+          git push

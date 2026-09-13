@@ -1,0 +1,156 @@
+"""
+Бот для отслеживания новостей по теме "переговоры по Украине"
+и отправки ссылок в Telegram-канал.
+
+Как это работает:
+1. Забирает новости из Google News RSS по заданным ключевым словам
+   (Google News сам агрегирует ТАСС, РИА, Reuters, Bloomberg и тысячи
+   других источников — не нужно искать RSS каждого сайта отдельно).
+2. Дополнительно проверяет пару прямых RSS-лент (ТАСС, РИА) для надёжности.
+3. Отбирает только те новости, где есть нужные ключевые слова.
+4. Не отправляет повторно то, что уже было отправлено (хранит список
+   отправленных ссылок в файле seen_links.json).
+5. Отправляет заголовок + ссылку в Telegram-канал.
+"""
+
+import json
+import os
+import re
+import time
+from pathlib import Path
+from urllib.parse import quote
+
+import feedparser
+import requests
+
+# ========== НАСТРОЙКИ ==========
+
+# Токен бота и канал берутся из переменных окружения (секретов GitHub),
+# а не хранятся в коде напрямую — это безопаснее.
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "@news_isv_bot")
+
+# Ключевые слова, по которым фильтруются новости.
+# Новость публикуется, если хотя бы одно слово из любой группы найдено
+# И хотя бы одно слово, связанное с "переговоры" ИЛИ явно про Украину-мир.
+KEYWORDS = [
+    "переговоры по украине",
+    "переговоры украина",
+    "мирный план украина",
+    "мирное соглашение украина",
+    "прекращение огня украина",
+    "перемирие украина",
+    "украина сша переговоры",
+    "зеленский трамп переговоры",
+    "путин переговоры украина",
+    "ukraine peace talks",
+    "ukraine ceasefire",
+    "ukraine negotiations",
+    "ukraine peace deal",
+]
+
+# Поисковый запрос для Google News (агрегирует много источников сразу)
+GOOGLE_NEWS_QUERY = "переговоры Украина"
+GOOGLE_NEWS_RSS = (
+    f"https://news.google.com/rss/search?q={quote(GOOGLE_NEWS_QUERY)}"
+    "&hl=ru&gl=RU&ceid=RU:ru"
+)
+
+# Дополнительные прямые RSS-ленты (можно добавлять свои)
+DIRECT_FEEDS = [
+    "https://tass.ru/rss/v2.xml",
+    "https://ria.ru/export/rss2/archive/index.xml",
+]
+
+ALL_FEEDS = [GOOGLE_NEWS_RSS] + DIRECT_FEEDS
+
+SEEN_FILE = Path(__file__).parent / "seen_links.json"
+
+# ========== ЛОГИКА ==========
+
+
+def load_seen() -> set:
+    if SEEN_FILE.exists():
+        try:
+            return set(json.loads(SEEN_FILE.read_text(encoding="utf-8")))
+        except Exception:
+            return set()
+    return set()
+
+
+def save_seen(seen: set) -> None:
+    # Храним не более 2000 последних ссылок, чтобы файл не рос бесконечно
+    trimmed = list(seen)[-2000:]
+    SEEN_FILE.write_text(
+        json.dumps(trimmed, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def is_relevant(title: str, summary: str) -> bool:
+    text = f"{title} {summary}".lower()
+    return any(kw.lower() in text for kw in KEYWORDS)
+
+
+def send_to_telegram(title: str, link: str) -> bool:
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    text = f"{title}\n{link}"
+    try:
+        resp = requests.post(
+            url,
+            data={
+                "chat_id": CHANNEL_ID,
+                "text": text,
+                "disable_web_page_preview": False,
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            print(f"Ошибка отправки в Telegram: {resp.status_code} {resp.text}")
+            return False
+        return True
+    except requests.RequestException as exc:
+        print(f"Сетевая ошибка при отправке в Telegram: {exc}")
+        return False
+
+
+def clean_html(raw: str) -> str:
+    return re.sub("<[^<]+?>", "", raw or "").strip()
+
+
+def check_feeds() -> None:
+    seen = load_seen()
+    new_items_sent = 0
+
+    for feed_url in ALL_FEEDS:
+        print(f"Проверяю ленту: {feed_url}")
+        try:
+            feed = feedparser.parse(feed_url)
+        except Exception as exc:
+            print(f"Не удалось прочитать ленту {feed_url}: {exc}")
+            continue
+
+        for entry in feed.entries:
+            link = entry.get("link", "")
+            title = clean_html(entry.get("title", ""))
+            summary = clean_html(entry.get("summary", ""))
+
+            if not link or link in seen:
+                continue
+
+            # Для Google News ссылки уже отфильтрованы поисковым запросом,
+            # но для прямых лент (ТАСС/РИА) нужна собственная фильтрация.
+            if feed_url == GOOGLE_NEWS_RSS or is_relevant(title, summary):
+                sent = send_to_telegram(title, link)
+                if sent:
+                    new_items_sent += 1
+                    print(f"Отправлено: {title}")
+                    time.sleep(1)  # небольшая пауза, чтобы не спамить API
+
+            seen.add(link)
+
+    save_seen(seen)
+    print(f"Готово. Новых новостей отправлено: {new_items_sent}")
+
+
+if __name__ == "__main__":
+    check_feeds()
